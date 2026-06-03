@@ -24,6 +24,16 @@ import typer
 studio_app = typer.Typer(help = "Unsloth Studio commands.")
 
 
+def _dbg(msg: str, **kv) -> None:
+    """Print a debug line when UNSLOTH_DEBUG=1 is set."""
+    if not os.environ.get("UNSLOTH_DEBUG", "").strip():
+        return
+    parts = [f"[debug] {msg}"]
+    for k, v in kv.items():
+        parts.append(f"  {k}={v!r}")
+    typer.echo("\n".join(parts))
+
+
 # Resolve install root: UNSLOTH_STUDIO_HOME, then STUDIO_HOME alias, then
 # sys.prefix inference (so a direct call to <root>/bin/unsloth resolves after
 # the installer's env var has expired), then legacy ~/.unsloth/studio.
@@ -44,21 +54,28 @@ def _resolve_studio_home() -> tuple[Path, bool]:
         override = (os.environ.get("STUDIO_HOME") or "").strip()
     if override:
         try:
-            return Path(override).expanduser().resolve(), True
+            result = Path(override).expanduser().resolve(), True
         except (OSError, ValueError):
-            return Path(override).expanduser(), True
+            result = Path(override).expanduser(), True
+        _dbg("studio_home_from_env", path=result[0], env_var="UNSLOTH_STUDIO_HOME/STUDIO_HOME")
+        return result
     try:
         prefix = Path(sys.prefix).resolve()
+        _dbg("sys_prefix", prefix=prefix)
         if prefix.name == "unsloth_studio":
             inferred = prefix.parent
             legacy = (Path.home() / ".unsloth" / "studio").resolve()
+            _dbg("inferred_studio_home", inferred=inferred, legacy=legacy)
             if inferred != legacy and _looks_like_installer_managed_studio_home(
                 inferred
             ):
+                _dbg("studio_home_inferred_from_prefix", path=inferred)
                 return inferred, True
     except (OSError, ValueError):
         pass
-    return Path.home() / ".unsloth" / "studio", False
+    default = Path.home() / ".unsloth" / "studio"
+    _dbg("studio_home_default", path=default)
+    return default, False
 
 
 STUDIO_HOME, _STUDIO_HOME_IS_CUSTOM = _resolve_studio_home()
@@ -156,13 +173,35 @@ def _stream_for_subprocess(stream):
     return stream
 
 
+def _recorded_studio_venv_dir() -> Optional[Path]:
+    """Return the venv dir recorded by --conda-env installs, or None."""
+    venv_path_file = STUDIO_HOME / "share" / "studio_venv_path"
+    if venv_path_file.is_file():
+        try:
+            recorded = Path(venv_path_file.read_text().strip())
+            if recorded.is_dir():
+                return recorded
+        except (OSError, ValueError):
+            pass
+    return None
+
+
 def _studio_venv_python() -> Optional[Path]:
     """Return the studio venv Python binary, or None if not set up."""
     if platform.system() == "Windows":
-        p = STUDIO_HOME / "unsloth_studio" / "Scripts" / "python.exe"
+        bin_dir, py_name = "Scripts", "python.exe"
     else:
-        p = STUDIO_HOME / "unsloth_studio" / "bin" / "python"
-    return p if p.is_file() else None
+        bin_dir, py_name = "bin", "python"
+    p = STUDIO_HOME / "unsloth_studio" / bin_dir / py_name
+    if p.is_file():
+        return p
+    # Fallback: venv path recorded by --conda-env installs
+    recorded = _recorded_studio_venv_dir()
+    if recorded is not None:
+        p2 = recorded / bin_dir / py_name
+        if p2.is_file():
+            return p2
+    return None
 
 
 def _find_run_py() -> Optional[Path]:
@@ -629,10 +668,19 @@ def studio_default(
     # Use the studio venv if it exists and we aren't already in it.
     studio_venv_dir = STUDIO_HOME / "unsloth_studio"
     in_studio_venv = sys.prefix.startswith(str(studio_venv_dir))
+    _dbg("venv_check", studio_venv_dir=studio_venv_dir, sys_prefix=sys.prefix, in_studio_venv=in_studio_venv)
+    if not in_studio_venv:
+        _rec = _recorded_studio_venv_dir()
+        _dbg("recorded_venv", recorded=_rec)
+        if _rec is not None and sys.prefix.startswith(str(_rec)):
+            in_studio_venv = True
+            _dbg("in_studio_venv_via_recorded", recorded=_rec)
 
     if not in_studio_venv:
         studio_python = _studio_venv_python()
         run_py = _find_run_py()
+        _dbg("studio_venv_python", studio_python=studio_python)
+        _dbg("run_py", run_py=run_py)
         if studio_python and run_py:
             if not silent:
                 typer.echo("Launching Unsloth Studio... Please wait...")
@@ -658,6 +706,7 @@ def studio_default(
                 args.append("--silent")
             if api_only:
                 args.append("--api-only")
+            _dbg("re_exec_args", args=args)
             # On Windows os.execvp keeps the parent alive, so Ctrl+C
             # would orphan the child; use Popen+wait instead.
             if sys.platform == "win32":
@@ -953,14 +1002,25 @@ def run(
     # 1. Re-exec into the studio venv (same pattern as studio_default).
     studio_venv_dir = STUDIO_HOME / "unsloth_studio"
     in_studio_venv = sys.prefix.startswith(str(studio_venv_dir))
+    _dbg("run_venv_check", studio_venv_dir=studio_venv_dir, sys_prefix=sys.prefix, in_studio_venv=in_studio_venv)
+    if not in_studio_venv:
+        _rec = _recorded_studio_venv_dir()
+        _dbg("run_recorded_venv", recorded=_rec)
+        if _rec is not None and sys.prefix.startswith(str(_rec)):
+            in_studio_venv = True
+            _dbg("run_in_studio_venv_via_recorded", recorded=_rec)
 
+    _dbg("run_model", model=model, gguf_variant=gguf_variant, max_seq_length=max_seq_length, load_in_4bit=load_in_4bit)
+    _dbg("run_server_args", host=host, port=port, parallel=parallel, enable_tools=enable_tools)
     if not in_studio_venv:
         studio_python = _studio_venv_python()
+        _dbg("run_studio_python", studio_python=studio_python)
         if not studio_python:
             typer.echo("Studio not set up. Run install.sh first.")
             raise typer.Exit(1)
         # Re-exec via the studio venv's `unsloth` console-script.
         studio_bin = studio_python.parent / "unsloth"
+        _dbg("run_studio_bin", studio_bin=studio_bin, exists=studio_bin.is_file())
         if not studio_bin.is_file():
             typer.echo(
                 "Studio venv missing 'unsloth' entry point. Re-run: unsloth studio setup"
@@ -1006,6 +1066,7 @@ def run(
         if extra_llama_args:
             args.extend(extra_llama_args)
 
+        _dbg("run_re_exec_args", args=args)
         if sys.platform == "win32":
             proc = subprocess.Popen(args)
             try:
@@ -1041,11 +1102,22 @@ def run(
         raise typer.Exit(1)
 
     # 4. Create API key in-process.
+    _dbg("creating_api_key", name=api_key_name, port=actual_port)
     api_key = _create_api_key_inprocess(api_key_name)
+    _dbg("api_key_created", prefix=api_key[:8] + "..." if len(api_key) > 8 else "<short>")
 
     # 5. Load model via HTTP.
     if not silent:
         typer.echo(f"Loading model: {model}...")
+    _dbg(
+        "model_load_request",
+        port=actual_port,
+        model=model,
+        gguf_variant=gguf_variant,
+        max_seq_length=max_seq_length,
+        load_in_4bit=load_in_4bit,
+        extra_llama_args=extra_llama_args,
+    )
     try:
         result = _load_model_via_http(
             port = actual_port,
@@ -1056,6 +1128,7 @@ def run(
             load_in_4bit = load_in_4bit,
             llama_extra_args = extra_llama_args,
         )
+        _dbg("model_load_response", result=result)
     except RuntimeError as exc:
         typer.echo(f"Error: {exc}", err = True)
         raise typer.Exit(1)

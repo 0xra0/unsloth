@@ -649,11 +649,24 @@ def run_server(
     # Create all standard directories on startup
     ensure_studio_directories()
 
+    logger.debug(
+        "server_startup",
+        host = host,
+        port = port,
+        api_only = api_only,
+        llama_parallel_slots = llama_parallel_slots,
+        frontend_path = str(frontend_path),
+        python = sys.executable,
+        pid = os.getpid(),
+    )
+
     # Auto-find free port if requested port is in use
     if not _is_port_free(host, port):
         original_port = port
         blocker = _get_pid_on_port(port)
+        logger.debug("port_in_use", port = original_port, blocker = blocker)
         port = _find_free_port(host, port + 1)
+        logger.debug("port_remapped", original = original_port, chosen = port)
         if not silent:
             print("")
             print("=" * 50)
@@ -668,12 +681,19 @@ def run_server(
             print(f"Open http://localhost:{port} in your browser.")
             print("=" * 50)
             print("")
+    else:
+        logger.debug("port_free", host = host, port = port)
 
     # Setup frontend if path provided (skip in api-only mode).
     # Falls back through alternate locations if the default lacks a built
     # dist; errors out loudly rather than silently serving 404 on `/`.
     if frontend_path and not api_only:
         chosen, attempted = _resolve_frontend_path(Path(frontend_path))
+        logger.debug(
+            "frontend_resolution",
+            chosen = str(chosen) if chosen else None,
+            attempted = [str(p) for p in attempted],
+        )
         if chosen is not None and setup_frontend(app, chosen):
             if not silent:
                 # Resolve so logs always show an absolute path for support.
@@ -758,17 +778,21 @@ def run_server(
 
     # Run server in a daemon thread
     def _run():
+        logger.debug("uvicorn_thread_started", host = host, port = port)
         try:
             asyncio.run(_server.serve())
         except BaseException as exc:
+            logger.debug("uvicorn_thread_error", error = str(exc))
             startup_errors.append(exc)
             startup_failed.set()
         finally:
             if not ready_event.is_set():
+                logger.debug("uvicorn_thread_exited_before_ready")
                 startup_failed.set()
 
     thread = Thread(target = _run, daemon = True)
     thread.start()
+    logger.debug("uvicorn_thread_spawned", thread_name = thread.name)
 
     # Wait until uvicorn has completed lifespan startup and bound sockets, or
     # until the server exits/fails before startup. This intentionally has no
@@ -787,6 +811,7 @@ def run_server(
         _shutdown_event.set()
         raise
 
+    logger.debug("server_ready", host = host, port = port, pid = os.getpid())
     _write_pid_file()
     import atexit
 

@@ -21,6 +21,96 @@ from utils.native_path_leases import child_env_without_native_path_secret
 logger = get_logger(__name__)
 
 
+def _run_rocm_smi(*args: str, timeout: int = 5) -> Optional[dict]:
+    """Run rocm-smi with the given arguments and return parsed JSON, or None."""
+    try:
+        result = subprocess.run(
+            ["rocm-smi", *args, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=child_env_without_native_path_secret(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("rocm-smi query failed: %s", e)
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        logger.debug("rocm-smi returned code %d", result.returncode)
+        return None
+    # rocm-smi prepends WARNING lines before JSON — strip them
+    lines = [l for l in result.stdout.splitlines() if not l.startswith("WARNING")]
+    clean = "\n".join(lines).strip()
+    if not clean:
+        return None
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        logger.debug("Failed to parse rocm-smi JSON output")
+        return None
+
+
+def _extract_rocm_smi_metrics(data: dict) -> dict[str, Any]:
+    """Extract standardised metrics from rocm-smi JSON output.
+
+    rocm-smi returns ``{"card0": {...}, "card1": {...}}`` where values are
+    strings.  We take the first card entry that looks like a GPU.
+    """
+    # Find the first card* key
+    card_data: dict = {}
+    for key in sorted(data.keys()):
+        if isinstance(data[key], dict):
+            card_data = data[key]
+            break
+    if not card_data:
+        return {}
+
+    def _str_float(v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    gpu_util = _str_float(card_data.get("GPU use (%)"))
+    temp = _str_float(
+        card_data.get(
+            "Temperature (Sensor edge) (C)",
+            card_data.get("Temperature (Sensor junction) (C)"),
+        )
+    )
+    power_draw = _str_float(
+        card_data.get(
+            "Average Graphics Package Power (W)",
+            card_data.get("Current Socket Graphics Package Power (W)"),
+        )
+    )
+
+    vram_total_b = _str_float(card_data.get("VRAM Total Memory (B)"))
+    vram_used_b = _str_float(card_data.get("VRAM Total Used Memory (B)"))
+    vram_total_mb = vram_total_b / (1024 * 1024) if vram_total_b is not None else None
+    vram_used_mb = vram_used_b / (1024 * 1024) if vram_used_b is not None else None
+
+    vram_used_gb = round(vram_used_mb / 1024, 2) if vram_used_mb is not None else None
+    vram_total_gb = round(vram_total_mb / 1024, 2) if vram_total_mb is not None else None
+    vram_util = (
+        round((vram_used_mb / vram_total_mb) * 100, 1)
+        if vram_used_mb is not None and vram_total_mb is not None and vram_total_mb > 0
+        else None
+    )
+
+    return {
+        "gpu_utilization_pct": gpu_util,
+        "temperature_c": temp,
+        "vram_used_gb": vram_used_gb,
+        "vram_total_gb": vram_total_gb,
+        "vram_utilization_pct": vram_util,
+        "power_draw_w": power_draw,
+        "power_limit_w": None,
+        "power_utilization_pct": None,
+    }
+
+
 def _run_amd_smi(*args: str, timeout: int = 5) -> Optional[Any]:
     """Run amd-smi with the given arguments and return parsed JSON, or None."""
     try:
@@ -268,31 +358,38 @@ def get_primary_gpu_utilization() -> dict[str, Any]:
     if gpu_idx is None:
         return {"available": False}
     data = _run_amd_smi("metric", "-g", gpu_idx)
-    if data is None:
-        return {"available": False}
 
-    # amd-smi may return:
-    #   - a list of GPU dicts (older versions)
-    #   - a dict with a "gpu_data" key wrapping a list (newer versions)
-    #   - a single GPU dict (rare)
-    if isinstance(data, dict) and "gpu_data" in data:
-        data = data["gpu_data"]
-    if isinstance(data, list):
-        if len(data) == 0:
-            return {"available": False}
-        gpu_data = data[0]
-    else:
-        gpu_data = data
+    if data is not None:
+        # amd-smi may return:
+        #   - a list of GPU dicts (older versions)
+        #   - a dict with a "gpu_data" key wrapping a list (newer versions)
+        #   - a single GPU dict (rare)
+        if isinstance(data, dict) and "gpu_data" in data:
+            data = data["gpu_data"]
+        if isinstance(data, list):
+            gpu_data = data[0] if data else None
+        else:
+            gpu_data = data
 
-    metrics = _extract_gpu_metrics(gpu_data)
-    if not _has_real_metrics(metrics):
-        # amd-smi returned a JSON envelope with no usable fields (error
-        # response or unsupported card). Surface as unavailable rather
-        # than available-with-empty-data so the UI does not render a
-        # ghost device.
-        return {"available": False}
-    metrics["available"] = True
-    return metrics
+        if gpu_data is not None:
+            metrics = _extract_gpu_metrics(gpu_data)
+            if _has_real_metrics(metrics):
+                metrics["available"] = True
+                return metrics
+
+    # amd-smi failed or returned no usable data — fall back to rocm-smi.
+    # rocm-smi is more reliable under heavy GPU compute load.
+    logger.debug("amd-smi metric unavailable, trying rocm-smi fallback")
+    rocm_data = _run_rocm_smi(
+        "--showuse", "--showtemp", "--showpower", "--showmeminfo", "vram"
+    )
+    if rocm_data is not None:
+        metrics = _extract_rocm_smi_metrics(rocm_data)
+        if _has_real_metrics(metrics):
+            metrics["available"] = True
+            return metrics
+
+    return {"available": False}
 
 
 def get_visible_gpu_utilization(
@@ -311,6 +408,25 @@ def get_visible_gpu_utilization(
 
     data = _run_amd_smi("metric")
     if data is None:
+        # amd-smi failed — try rocm-smi fallback before giving up
+        logger.debug("amd-smi metric unavailable for visible GPUs, trying rocm-smi")
+        rocm_data = _run_rocm_smi(
+            "--showuse", "--showtemp", "--showpower", "--showmeminfo", "vram"
+        )
+        if rocm_data is not None:
+            metrics = _extract_rocm_smi_metrics(rocm_data)
+            if _has_real_metrics(metrics) and parent_visible_ids:
+                gpu_id = parent_visible_ids[0]
+                metrics["index"] = gpu_id
+                metrics["index_kind"] = "physical"
+                metrics["visible_ordinal"] = 0
+                return {
+                    "available": True,
+                    "backend_cuda_visible_devices": parent_cuda_visible_devices,
+                    "parent_visible_gpu_ids": parent_visible_ids,
+                    "devices": [metrics],
+                    "index_kind": "physical",
+                }
         return {
             "available": False,
             "backend_cuda_visible_devices": parent_cuda_visible_devices,

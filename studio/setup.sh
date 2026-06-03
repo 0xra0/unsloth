@@ -447,7 +447,12 @@ if [ -n "$_studio_override" ]; then
 else
     STUDIO_HOME="$HOME/.unsloth/studio"
 fi
-VENV_DIR="$STUDIO_HOME/unsloth_studio"
+# Allow install.sh --conda-env (or any caller) to point at an existing env.
+if [ -n "${UNSLOTH_STUDIO_VENV_DIR:-}" ]; then
+    VENV_DIR="$UNSLOTH_STUDIO_VENV_DIR"
+else
+    VENV_DIR="$STUDIO_HOME/unsloth_studio"
+fi
 VENV_T5_530_DIR="$STUDIO_HOME/.venv_t5_530"
 VENV_T5_550_DIR="$STUDIO_HOME/.venv_t5_550"
 
@@ -487,7 +492,13 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
         exit 1
     fi
 else
-    source "$VENV_DIR/bin/activate"
+    if [ -f "$VENV_DIR/bin/activate" ]; then
+        source "$VENV_DIR/bin/activate"
+    else
+        # Conda env: no activate script; put the env's bin first on PATH.
+        export PATH="$VENV_DIR/bin:$PATH"
+        export VIRTUAL_ENV="$VENV_DIR"
+    fi
 fi
 
 install_python_stack() {

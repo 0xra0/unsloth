@@ -31,29 +31,57 @@ _NATIVE_PATH_LEASE_RE = re.compile(
 )
 
 
+_SENSITIVE_HEADERS = frozenset(
+    {"authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"}
+)
+
+
+def _safe_headers(headers) -> dict:
+    return {
+        k: ("<redacted>" if k.lower() in _SENSITIVE_HEADERS else v)
+        for k, v in headers.items()
+    }
+
+
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         start_time = time.time()
 
+        EXCLUDED_PATHS = {
+            "/api/train/status",
+            "/api/train/metrics",
+            "/api/train/hardware",
+            "/api/system",
+        }
+        is_excluded = (
+            request.url.path in EXCLUDED_PATHS
+            or request.url.path.startswith("/assets/")
+            or request.url.path.endswith(
+                (".png", ".jpg", ".jpeg", ".ico", ".woff", ".woff2", ".ttf")
+            )
+        )
+
+        if not is_excluded:
+            debug_ctx: dict = {
+                "method": request.method,
+                "path": request.url.path,
+            }
+            if request.query_params:
+                debug_ctx["query"] = str(request.query_params)
+            content_length = request.headers.get("content-length")
+            if content_length:
+                debug_ctx["content_length"] = content_length
+            logger.debug("request_started", **debug_ctx)
+            logger.debug(
+                "request_headers",
+                path = request.url.path,
+                headers = _safe_headers(request.headers),
+            )
+
         try:
             response = await call_next(request)
 
-            # Log response
             process_time = (time.time() - start_time) * 1000
-
-            EXCLUDED_PATHS = {
-                "/api/train/status",
-                "/api/train/metrics",
-                "/api/train/hardware",
-                "/api/system",
-            }
-            is_excluded = (
-                request.url.path in EXCLUDED_PATHS
-                or request.url.path.startswith("/assets/")
-                or request.url.path.endswith(
-                    (".png", ".jpg", ".jpeg", ".ico", ".woff", ".woff2", ".ttf")
-                )
-            )
 
             if not is_excluded:
                 logger.info(
@@ -62,6 +90,12 @@ class LoggingMiddleware(BaseHTTPMiddleware):
                     path = request.url.path,
                     status_code = response.status_code,
                     process_time_ms = round(process_time, 2),
+                )
+                logger.debug(
+                    "response_headers",
+                    path = request.url.path,
+                    status_code = response.status_code,
+                    headers = dict(response.headers),
                 )
 
             return response

@@ -6,6 +6,7 @@
 # Usage (no-torch): ./install.sh --no-torch  (skip PyTorch, GGUF-only mode)
 # Usage (test):  ./install.sh --package roland-sloth  (install a different package name)
 # Usage (py):    ./install.sh --python 3.12  (override auto-detected Python version)
+# Usage (env):   ./install.sh --conda-env /path/to/conda/env  (use existing conda env)
 #
 # Env vars (priority: UNSLOTH_STUDIO_HOME > STUDIO_HOME > HOME-redirect > default):
 #   UNSLOTH_STUDIO_HOME=/abs/path  -> install under that path
@@ -46,8 +47,10 @@ _USER_PYTHON=""
 _NO_TORCH_FLAG=false
 _VERBOSE=false
 _SHORTCUTS_ONLY=false
+_CONDA_ENV_OVERRIDE=""
 _next_is_package=false
 _next_is_python=false
+_next_is_conda_env=false
 for arg in "$@"; do
     if [ "$_next_is_package" = true ]; then
         PACKAGE_NAME="$arg"
@@ -59,6 +62,11 @@ for arg in "$@"; do
         _next_is_python=false
         continue
     fi
+    if [ "$_next_is_conda_env" = true ]; then
+        _CONDA_ENV_OVERRIDE="$arg"
+        _next_is_conda_env=false
+        continue
+    fi
     case "$arg" in
         --local) STUDIO_LOCAL_INSTALL=true ;;
         --package) _next_is_package=true ;;
@@ -67,6 +75,7 @@ for arg in "$@"; do
         --no-torch) _NO_TORCH_FLAG=true ;;
         --verbose|-v) _VERBOSE=true ;;
         --shortcuts-only) _SHORTCUTS_ONLY=true ;;
+        --conda-env) _next_is_conda_env=true ;;
     esac
 done
 
@@ -177,7 +186,7 @@ _install_bnb_rocm() {
     # (0.50.0.dev0). pip accepts the mismatch, so bootstrap pip and use it.
     if ! "$_venv_py" -m pip --version >/dev/null 2>&1; then
         if ! run_maybe_quiet "$_venv_py" -m ensurepip --upgrade; then
-            run_maybe_quiet uv pip install --python "$_venv_py" pip || \
+            run_maybe_quiet "$_venv_py" -m pip install pip || \
                 substep "[WARN] could not bootstrap pip; bitsandbytes install will likely fail" "$C_WARN"
         fi
     fi
@@ -199,6 +208,10 @@ if [ "$_next_is_package" = true ]; then
 fi
 if [ "$_next_is_python" = true ]; then
     echo "❌ ERROR: --python requires a version argument (e.g. --python 3.12)." >&2
+    exit 1
+fi
+if [ "$_next_is_conda_env" = true ]; then
+    echo "❌ ERROR: --conda-env requires a path argument (e.g. --conda-env /opt/conda/envs/myenv)." >&2
     exit 1
 fi
 
@@ -339,6 +352,22 @@ _resolve_studio_destinations() {
 }
 _resolve_studio_destinations
 VENV_DIR="$STUDIO_HOME/unsloth_studio"
+
+# --conda-env PATH: use an existing conda environment instead of creating one.
+# Also auto-detect if we're already inside an activated conda env (CONDA_PREFIX).
+if [ -n "$_CONDA_ENV_OVERRIDE" ]; then
+    case "$_CONDA_ENV_OVERRIDE" in
+        "~") _CONDA_ENV_OVERRIDE="$HOME" ;;
+        "~/"*) _CONDA_ENV_OVERRIDE="$HOME/${_CONDA_ENV_OVERRIDE#'~/'}" ;;
+    esac
+    VENV_DIR="$_CONDA_ENV_OVERRIDE"
+elif [ -z "$_CONDA_ENV_OVERRIDE" ] && [ -n "${CONDA_PREFIX:-}" ] \
+     && [ "${CONDA_PREFIX:-}" != "${CONDA_PREFIX_1:-}" ]; then
+    # An env is active and it's not the base env — use it automatically.
+    _CONDA_ENV_OVERRIDE="$CONDA_PREFIX"
+    VENV_DIR="$CONDA_PREFIX"
+fi
+
 _VENV_ROLLBACK_DIR=""
 _VENV_ROLLBACK_TARGET="$VENV_DIR"
 _VENV_ROLLBACK_ACTIVE=false
@@ -1294,7 +1323,7 @@ fi
 if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
     _OVERRIDES_FILE="$(cd "$(dirname "$0" 2>/dev/null || echo ".")" && pwd)/studio/backend/requirements/single-env/overrides-darwin-arm64.txt"
     if [ -f "$_OVERRIDES_FILE" ]; then
-        export UV_OVERRIDE="$_OVERRIDES_FILE"
+        export PIP_CONSTRAINT="$_OVERRIDES_FILE"
     fi
 fi
 
@@ -1377,60 +1406,48 @@ else
     step "deps" "all system dependencies found"
 fi
 
-# ── Install uv ──
-tauri_log "STEP" "Installing uv package manager"
-UV_MIN_VERSION="0.7.14"
+# ── Ensure conda is available ──
+tauri_log "STEP" "Checking conda"
+_CONDA=""
+for _cpath in \
+    "$(command -v conda 2>/dev/null || true)" \
+    "$HOME/miniconda3/bin/conda" \
+    "$HOME/miniforge3/bin/conda" \
+    "$HOME/mambaforge/bin/conda" \
+    "$HOME/anaconda3/bin/conda" \
+    "/opt/conda/bin/conda" \
+    "/usr/local/conda/bin/conda"; do
+    [ -x "$_cpath" ] || continue
+    _CONDA="$_cpath"
+    break
+done
 
-version_ge() {
-    # returns 0 if $1 >= $2
-    _a=$1
-    _b=$2
-
-    while [ -n "$_a" ] || [ -n "$_b" ]; do
-        _a_part=${_a%%.*}
-        _b_part=${_b%%.*}
-
-        [ "$_a" = "$_a_part" ] && _a="" || _a=${_a#*.}
-        [ "$_b" = "$_b_part" ] && _b="" || _b=${_b#*.}
-
-        [ -z "$_a_part" ] && _a_part=0
-        [ -z "$_b_part" ] && _b_part=0
-
-        if [ "$_a_part" -gt "$_b_part" ]; then
-            return 0
-        fi
-        if [ "$_a_part" -lt "$_b_part" ]; then
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-_uv_version_ok() {
-    _raw=$("$1" --version 2>/dev/null | awk '{print $2}') || return 1
-    [ -n "$_raw" ] || return 1
-    _ver=${_raw%%[-+]*}
-    case "$_ver" in
-        ''|*[!0-9.]*) return 1 ;;
+if [ -z "$_CONDA" ]; then
+    substep "conda not found — installing Miniconda..."
+    _mc_tmp=$(mktemp)
+    case "${OS:-linux}" in
+        macos)
+            case "${_ARCH:-x86_64}" in
+                arm64) _mc_url="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh" ;;
+                *)     _mc_url="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh" ;;
+            esac ;;
+        *)
+            case "${_ARCH:-x86_64}" in
+                aarch64|arm64) _mc_url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh" ;;
+                *)             _mc_url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" ;;
+            esac ;;
     esac
-    version_ge "$_ver" "$UV_MIN_VERSION" || return 1
-    # Prerelease of the exact minimum (e.g. 0.7.14-rc1) is still below stable 0.7.14
-    [ "$_ver" = "$UV_MIN_VERSION" ] && [ "$_raw" != "$_ver" ] && return 1
-    return 0
-}
-
-if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
-    substep "installing uv package manager..."
-    _uv_tmp=$(mktemp)
-    download "https://astral.sh/uv/install.sh" "$_uv_tmp"
-    run_maybe_quiet sh "$_uv_tmp" </dev/null
-    rm -f "$_uv_tmp"
-    if [ -f "$HOME/.local/bin/env" ]; then
-        . "$HOME/.local/bin/env"
+    download "$_mc_url" "$_mc_tmp"
+    run_maybe_quiet sh "$_mc_tmp" -b -p "$HOME/miniconda3" </dev/null
+    rm -f "$_mc_tmp"
+    _CONDA="$HOME/miniconda3/bin/conda"
+    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "$HOME/miniconda3/etc/profile.d/conda.sh" 2>/dev/null || true
     fi
-    export PATH="$HOME/.local/bin:$PATH"
+    export PATH="$HOME/miniconda3/bin:$PATH"
 fi
+
+step "conda" "$($_CONDA --version 2>/dev/null || echo 'ready')"
 
 # ── Create venv (migrate old layout if possible, otherwise fresh) ──
 tauri_log "STEP" "Creating virtual environment"
@@ -1439,6 +1456,10 @@ mkdir -p "$STUDIO_HOME"
 _MIGRATED=false
 
 if [ -x "$VENV_DIR/bin/python" ]; then
+    if [ -n "$_CONDA_ENV_OVERRIDE" ]; then
+        # External env: skip ownership check and rollback — never move/delete it.
+        substep "using existing conda env: $VENV_DIR"
+    else
     # why: matching guard to the .venv branch below -- in env-mode
     # $STUDIO_HOME is a user-chosen workspace, so refuse to nuke an
     # existing $STUDIO_HOME/unsloth_studio that lacks Studio sentinels.
@@ -1457,6 +1478,7 @@ if [ -x "$VENV_DIR/bin/python" ]; then
     # New layout already exists — replace only after preserving rollback copy.
     substep "preserving existing environment for rollback..."
     _start_studio_venv_replacement "$VENV_DIR"
+    fi
 elif [ "$_STUDIO_HOME_REDIRECT" != "env" ] && [ -x "$STUDIO_HOME/.venv/bin/python" ]; then
     # Old layout exists — validate before migrating.
     # Skip in env-mode so we don't rm -rf an unrelated .venv at the
@@ -1494,7 +1516,7 @@ fi
 
 # If an Intel Mac has a stale 3.13 venv from a previous failed install, recreate
 # (skip when the user explicitly chose a version via --python)
-if [ "$SKIP_TORCH" = true ] && [ "$MAC_INTEL" = true ] && [ -z "$_USER_PYTHON" ] && [ -x "$VENV_DIR/bin/python" ]; then
+if [ -z "$_CONDA_ENV_OVERRIDE" ] && [ "$SKIP_TORCH" = true ] && [ "$MAC_INTEL" = true ] && [ -z "$_USER_PYTHON" ] && [ -x "$VENV_DIR/bin/python" ]; then
     _PY_MM=$("$VENV_DIR/bin/python" -c \
         "import sys; print('{}.{}'.format(*sys.version_info[:2]))" 2>/dev/null || echo "")
     if [ "$_PY_MM" != "3.12" ]; then
@@ -1503,22 +1525,30 @@ if [ "$SKIP_TORCH" = true ] && [ "$MAC_INTEL" = true ] && [ -z "$_USER_PYTHON" ]
     fi
 fi
 
-if [ ! -x "$VENV_DIR/bin/python" ]; then
+if [ -n "$_CONDA_ENV_OVERRIDE" ]; then
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        echo "ERROR: --conda-env path has no python binary at $VENV_DIR/bin/python" >&2
+        exit 1
+    fi
+    step "venv" "using existing conda env"
+    substep "$VENV_DIR"
+elif [ ! -x "$VENV_DIR/bin/python" ]; then
     step "venv" "creating Python ${PYTHON_VERSION} virtual environment"
     substep "$VENV_DIR"
-    run_install_cmd "create venv" uv venv "$VENV_DIR" --python "$PYTHON_VERSION"
+    substep "(first-time conda env creation may take 1-2 minutes)"
+    run_install_cmd "create venv" "$_CONDA" create -p "$VENV_DIR" \
+        "python=$PYTHON_VERSION" --yes --no-default-packages
+    run_maybe_quiet "$VENV_DIR/bin/python" -m pip install --upgrade pip
 fi
 
-# Mark the freshly-created venv as Studio-owned so a partial install can be
-# repaired by re-running install.sh; the env-mode deletion guard above accepts
-# this marker as the primary sentinel.
-if [ -x "$VENV_DIR/bin/python" ]; then
+# Mark the freshly-created venv as Studio-owned (skip for external envs).
+if [ -z "$_CONDA_ENV_OVERRIDE" ] && [ -x "$VENV_DIR/bin/python" ]; then
     : > "$VENV_DIR/.unsloth-studio-owned" 2>/dev/null || true
 fi
 
 # Guard against Python 3.13.8 torch import bug on Apple Silicon
 # (skip when the user explicitly chose a version via --python)
-if [ -z "$_USER_PYTHON" ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
+if [ -z "$_CONDA_ENV_OVERRIDE" ] && [ -z "$_USER_PYTHON" ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
     _PY_VER=$("$VENV_DIR/bin/python" -c \
         "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>/dev/null || echo "")
     if [ "$_PY_VER" = "3.13.8" ]; then
@@ -1526,7 +1556,9 @@ if [ -z "$_USER_PYTHON" ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
         echo "  Recreating venv with Python 3.12..."
         rm -rf "$VENV_DIR"
         PYTHON_VERSION="3.12"
-        run_install_cmd "recreate venv" uv venv "$VENV_DIR" --python "$PYTHON_VERSION"
+        run_install_cmd "recreate venv" "$_CONDA" create -p "$VENV_DIR" \
+            "python=$PYTHON_VERSION" --yes --no-default-packages
+        run_maybe_quiet "$VENV_DIR/bin/python" -m pip install --upgrade pip
         if [ -x "$VENV_DIR/bin/python" ]; then
             : > "$VENV_DIR/.unsloth-studio-owned" 2>/dev/null || true
         fi
@@ -1862,6 +1894,74 @@ esac
 # ── Install unsloth directly into the venv (no activation needed) ──
 tauri_log "STEP" "Installing PyTorch"
 _VENV_PY="$VENV_DIR/bin/python"
+_torch_already_installed() {
+    if [ -n "$_CONDA_ENV_OVERRIDE" ]; then
+        # Running a conda env's python directly (without `conda activate`) does
+        # not set LD_LIBRARY_PATH for ROCm/CUDA libs, so `import torch` may fail
+        # even when torch IS installed.  Use `pip show` instead — it only reads
+        # package metadata and works without activation.
+        _tai_ver=$("$_VENV_PY" -m pip show torch 2>/dev/null \
+            | awk '/^Version:/{print $2}')
+        [ -z "$_tai_ver" ] && return 1
+        case "$TORCH_INDEX_URL" in
+            */rocm*) case "$_tai_ver" in *rocm*) return 0 ;; *) return 1 ;; esac ;;
+            */cu*)   case "$_tai_ver" in *cu*)   return 0 ;; *) return 1 ;; esac ;;
+            *)       return 0 ;;
+        esac
+    fi
+    "$_VENV_PY" -c "import torch" >/dev/null 2>&1 || return 1
+    case "$TORCH_INDEX_URL" in
+        */rocm*) "$_VENV_PY" -c "import torch; v=getattr(torch.version,'hip',''); assert v" >/dev/null 2>&1 ;;
+        */cpu)   return 0 ;;
+        *)       "$_VENV_PY" -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1 ;;
+    esac
+}
+
+_is_pip_pkg_installed() {
+    "$_VENV_PY" -m pip show "$1" >/dev/null 2>&1
+}
+
+# Try installing torch from whatever system python has it, at the exact same
+# version — pip will serve from its local wheel cache if available, so no
+# re-download is needed when the user already has torch installed elsewhere.
+_try_install_torch_from_system() {
+    _sys_torch_ver="" _sys_tv_ver="" _sys_ta_ver=""
+    for _sp in "$(command -v python3 2>/dev/null || true)" \
+               "$(command -v python  2>/dev/null || true)"; do
+        [ -x "$_sp" ] || continue
+        # Skip if this python is from the venv we're about to populate,
+        # UNLESS --conda-env was used (that env already has packages).
+        if [ -z "$_CONDA_ENV_OVERRIDE" ]; then
+            case "$_sp" in "$VENV_DIR"*) continue ;; esac
+        fi
+        "$_sp" -c "import torch" >/dev/null 2>&1 || continue
+        # Variant must match what we detected for this machine
+        case "$TORCH_INDEX_URL" in
+            */rocm*)
+                "$_sp" -c "import torch; v=getattr(torch.version,'hip',''); assert v" \
+                    >/dev/null 2>&1 || continue ;;
+            */cpu) ;;
+            *)
+                "$_sp" -c "import torch; assert torch.cuda.is_available()" \
+                    >/dev/null 2>&1 || continue ;;
+        esac
+        _sys_torch_ver=$("$_sp" -c "import torch; print(torch.__version__)" 2>/dev/null) || continue
+        _sys_tv_ver=$("$_sp"    -c "import torchvision; print(torchvision.__version__)" 2>/dev/null) || true
+        _sys_ta_ver=$("$_sp"    -c "import torchaudio; print(torchaudio.__version__)" 2>/dev/null) || true
+        break
+    done
+    [ -z "$_sys_torch_ver" ] && return 1
+    # Strip local-version label (e.g. 2.6.0+rocm6.3 → 2.6.0) for pip pinning
+    _sv="${_sys_torch_ver%%+*}"
+    _install_pkgs="torch==$_sv"
+    [ -n "$_sys_tv_ver" ] && _install_pkgs="$_install_pkgs torchvision==${_sys_tv_ver%%+*}"
+    [ -n "$_sys_ta_ver" ] && _install_pkgs="$_install_pkgs torchaudio==${_sys_ta_ver%%+*}"
+    substep "torch ${_sys_torch_ver} found in system python — reusing version (pip cache if available)..."
+    # shellcheck disable=SC2086
+    run_install_cmd "install PyTorch (system version)" \
+        "$_VENV_PY" -m pip install --index-url "$TORCH_INDEX_URL" $_install_pkgs
+}
+
 if [ "$_MIGRATED" = true ]; then
     # Migrated env: force-reinstall unsloth+unsloth-zoo to ensure clean state
     # in the new venv location, while preserving existing torch/CUDA
@@ -1871,29 +1971,27 @@ if [ "$_MIGRATED" = true ]; then
         # PyPI metadata still declares torch as a hard dep), then install
         # runtime deps (typer, safetensors, transformers, etc.) with --no-deps
         # to prevent transitive torch resolution.
-        run_install_cmd "install unsloth (migrated no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
-            --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.5.8" unsloth-zoo
+        run_install_cmd "install unsloth (migrated no-torch)" "$_VENV_PY" -m pip install --no-deps \
+            --force-reinstall "unsloth>=2026.5.8" unsloth-zoo
         # Resolve pydantic WITH deps so pip pins pydantic-core to the
         # matching version (no-torch-runtime.txt below is --no-deps).
         # All transitive deps are torch-free.
         run_install_cmd "install pydantic (with deps for compatible core)" \
-            uv pip install --python "$_VENV_PY" pydantic
+            "$_VENV_PY" -m pip install pydantic
         _NO_TORCH_RT="$(_find_no_torch_runtime)"
         if [ -n "$_NO_TORCH_RT" ]; then
-            run_install_cmd "install no-torch runtime deps" uv pip install --python "$_VENV_PY" --no-deps -r "$_NO_TORCH_RT"
+            run_install_cmd "install no-torch runtime deps" "$_VENV_PY" -m pip install --no-deps -r "$_NO_TORCH_RT"
         fi
     else
-        run_install_cmd "install unsloth (migrated)" uv pip install --python "$_VENV_PY" \
-            --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.5.8" unsloth-zoo
+        run_install_cmd "install unsloth (migrated)" "$_VENV_PY" -m pip install \
+            --force-reinstall "unsloth>=2026.5.8" unsloth-zoo
     fi
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
         substep "overlaying local repo (editable)..."
-        run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
+        run_install_cmd "overlay local repo" "$_VENV_PY" -m pip install -e "$_REPO_ROOT" --no-deps
         substep "overlaying unsloth-zoo from git main..."
-        run_install_cmd "overlay unsloth-zoo (git main)" uv pip install --python "$_VENV_PY" \
-            --no-deps --reinstall-package unsloth-zoo \
+        run_install_cmd "overlay unsloth-zoo (git main)" "$_VENV_PY" -m pip install \
+            --no-deps --force-reinstall \
             "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
     fi
     # AMD ROCm: install bitsandbytes even in migrated environments so
@@ -1907,7 +2005,7 @@ if [ "$_MIGRATED" = true ]; then
                 _has_hip=$("$_VENV_PY" -c "import torch; print(getattr(torch.version,'hip','') or '')" 2>/dev/null || true)
                 if [ -z "$_has_hip" ]; then
                     substep "repairing ROCm torch (overwritten by dependency resolution)..."
-                    run_install_cmd "repair ROCm torch" uv pip install --python "$_VENV_PY" \
+                    run_install_cmd "repair ROCm torch" "$_VENV_PY" -m pip install \
                         "$TORCH_CONSTRAINT" torchvision torchaudio \
                         --index-url "$TORCH_INDEX_URL" \
                         --force-reinstall
@@ -1919,6 +2017,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
     # Fresh: Step 1 - install torch from explicit index (skip when --no-torch or Intel Mac)
     if [ "$SKIP_TORCH" = true ]; then
         substep "skipping PyTorch (--no-torch or Intel Mac x86_64)." "$C_WARN"
+    elif _torch_already_installed; then
+        substep "PyTorch already installed for this variant, skipping."
+    elif _try_install_torch_from_system; then
+        : # torch installed from system python version — no download needed
     elif [ "$_amd_gpu_radeon" = true ]; then
         _radeon_url=$(get_radeon_wheel_url)
         if [ -n "$_radeon_url" ]; then
@@ -1997,7 +2099,7 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 if [ -z "$_torch_whl" ] || [ -z "$_tv_whl" ] || [ -z "$_ta_whl" ] || \
                    [ "$_radeon_versions_match" != true ]; then
                     substep "[WARN] Radeon repo lacks a compatible wheel set for this Python; falling back to ROCm index ($TORCH_INDEX_URL)" "$C_WARN"
-                    run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
+                    run_install_cmd "install PyTorch" "$_VENV_PY" -m pip install \
                         "$TORCH_CONSTRAINT" torchvision torchaudio \
                         --index-url "$TORCH_INDEX_URL"
                 else
@@ -2009,30 +2111,31 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                     # filelock / sympy / networkx which are not in the
                     # Radeon listing.
                     if [ -n "$_tri_whl" ]; then
-                        run_install_cmd "install triton + PyTorch" uv pip install --python "$_VENV_PY" \
+                        run_install_cmd "install triton + PyTorch" "$_VENV_PY" -m pip install \
                             --find-links "$_RADEON_BASE_URL" \
                             "$_tri_whl" "$_torch_whl" "$_tv_whl" "$_ta_whl"
                     else
-                        run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
+                        run_install_cmd "install PyTorch" "$_VENV_PY" -m pip install \
                             --find-links "$_RADEON_BASE_URL" \
                             "$_torch_whl" "$_tv_whl" "$_ta_whl"
                     fi
                 fi
             else
                 substep "[WARN] Radeon repo unavailable; falling back to ROCm index ($TORCH_INDEX_URL)" "$C_WARN"
-                run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
+                run_install_cmd "install PyTorch" "$_VENV_PY" -m pip install \
                     "$TORCH_CONSTRAINT" torchvision torchaudio \
                     --index-url "$TORCH_INDEX_URL"
             fi
         else
             substep "[WARN] Radeon GPU detected but could not detect full ROCm version; falling back to ROCm index" "$C_WARN"
-            run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
+            run_install_cmd "install PyTorch" "$_VENV_PY" -m pip install \
                 "$TORCH_CONSTRAINT" torchvision torchaudio \
                 --index-url "$TORCH_INDEX_URL"
         fi
     else
         substep "installing PyTorch ($TORCH_INDEX_URL)..."
-        run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" "$TORCH_CONSTRAINT" torchvision torchaudio \
+        run_install_cmd "install PyTorch" "$_VENV_PY" -m pip install \
+            "$TORCH_CONSTRAINT" torchvision torchaudio \
             --index-url "$TORCH_INDEX_URL"
     fi
     # AMD ROCm: install bitsandbytes (once, after torch, for all ROCm paths).
@@ -2052,36 +2155,39 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
     if [ "$SKIP_TORCH" = true ]; then
         # No-torch: install unsloth + unsloth-zoo with --no-deps, then
         # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
-        run_install_cmd "install unsloth (no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
-            --upgrade-package unsloth --upgrade-package unsloth-zoo \
-            "unsloth>=2026.5.8" unsloth-zoo
+        if ! _is_pip_pkg_installed unsloth || ! _is_pip_pkg_installed unsloth-zoo; then
+            run_install_cmd "install unsloth (no-torch)" "$_VENV_PY" -m pip install --no-deps \
+                "unsloth>=2026.5.8" unsloth-zoo
+        fi
         # Same pydantic-with-deps trick as the migrated branch.
-        run_install_cmd "install pydantic (with deps for compatible core)" \
-            uv pip install --python "$_VENV_PY" pydantic
+        if ! _is_pip_pkg_installed pydantic; then
+            run_install_cmd "install pydantic (with deps for compatible core)" \
+                "$_VENV_PY" -m pip install pydantic
+        fi
         _NO_TORCH_RT="$(_find_no_torch_runtime)"
         if [ -n "$_NO_TORCH_RT" ]; then
-            run_install_cmd "install no-torch runtime deps" uv pip install --python "$_VENV_PY" --no-deps -r "$_NO_TORCH_RT"
+            run_install_cmd "install no-torch runtime deps" "$_VENV_PY" -m pip install --no-deps -r "$_NO_TORCH_RT"
         fi
         if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
             substep "overlaying local repo (editable)..."
-            run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
+            run_install_cmd "overlay local repo" "$_VENV_PY" -m pip install -e "$_REPO_ROOT" --no-deps
             substep "overlaying unsloth-zoo from git main..."
-            run_install_cmd "overlay unsloth-zoo (git main)" uv pip install --python "$_VENV_PY" \
-                --no-deps --reinstall-package unsloth-zoo \
+            run_install_cmd "overlay unsloth-zoo (git main)" "$_VENV_PY" -m pip install \
+                --no-deps --force-reinstall \
                 "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
         fi
     elif [ "$STUDIO_LOCAL_INSTALL" = true ]; then
-        run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
-            --upgrade-package unsloth "unsloth>=2026.5.8" unsloth-zoo
+        run_install_cmd "install unsloth (local)" "$_VENV_PY" -m pip install \
+            --upgrade "unsloth>=2026.5.8" unsloth-zoo
         substep "overlaying local repo (editable)..."
-        run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
+        run_install_cmd "overlay local repo" "$_VENV_PY" -m pip install -e "$_REPO_ROOT" --no-deps
         substep "overlaying unsloth-zoo from git main..."
-        run_install_cmd "overlay unsloth-zoo (git main)" uv pip install --python "$_VENV_PY" \
-            --no-deps --reinstall-package unsloth-zoo \
+        run_install_cmd "overlay unsloth-zoo (git main)" "$_VENV_PY" -m pip install \
+            --no-deps --force-reinstall \
             "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
     else
-        run_install_cmd "install unsloth" uv pip install --python "$_VENV_PY" \
-            --upgrade-package unsloth -- "$PACKAGE_NAME"
+        run_install_cmd "install unsloth" "$_VENV_PY" -m pip install \
+            --upgrade "$PACKAGE_NAME"
     fi
     # AMD ROCm: repair torch if the unsloth/unsloth-zoo install pulled in
     # CUDA torch from PyPI, overwriting the ROCm wheels installed in Step 1.
@@ -2091,7 +2197,7 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 _has_hip=$("$_VENV_PY" -c "import torch; print(getattr(torch.version,'hip','') or '')" 2>/dev/null || true)
                 if [ -z "$_has_hip" ]; then
                     substep "repairing ROCm torch (overwritten by dependency resolution)..."
-                    run_install_cmd "repair ROCm torch" uv pip install --python "$_VENV_PY" \
+                    run_install_cmd "repair ROCm torch" "$_VENV_PY" -m pip install \
                         "$TORCH_CONSTRAINT" torchvision torchaudio \
                         --index-url "$TORCH_INDEX_URL" \
                         --force-reinstall
@@ -2100,19 +2206,20 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
         esac
     fi
 else
-    # Fallback: GPU detection failed to produce a URL -- let uv resolve torch
+    # Fallback: GPU detection failed to produce a URL
     tauri_log "STEP" "Installing Unsloth"
     substep "installing unsloth (this may take a few minutes)..."
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
-        run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" unsloth-zoo "unsloth>=2026.5.8" --torch-backend=auto
+        run_install_cmd "install unsloth (auto)" "$_VENV_PY" -m pip install \
+            unsloth-zoo "unsloth>=2026.5.8"
         substep "overlaying local repo (editable)..."
-        run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
+        run_install_cmd "overlay local repo" "$_VENV_PY" -m pip install -e "$_REPO_ROOT" --no-deps
         substep "overlaying unsloth-zoo from git main..."
-        run_install_cmd "overlay unsloth-zoo (git main)" uv pip install --python "$_VENV_PY" \
-            --no-deps --reinstall-package unsloth-zoo \
+        run_install_cmd "overlay unsloth-zoo (git main)" "$_VENV_PY" -m pip install \
+            --no-deps --force-reinstall \
             "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
     else
-        run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" --torch-backend=auto -- "$PACKAGE_NAME"
+        run_install_cmd "install unsloth (auto)" "$_VENV_PY" -m pip install "$PACKAGE_NAME"
     fi
 fi
 
@@ -2163,10 +2270,14 @@ _SKIP_FRONTEND=0
 if [ "$TAURI_MODE" = true ]; then
     _SKIP_FRONTEND=1
 fi
-# Prepend UNSLOTH_STUDIO_HOME=$STUDIO_HOME to "$@" for env-override installs
-# without word-splitting on whitespace paths.
+# Prepend UNSLOTH_STUDIO_HOME=$STUDIO_HOME (and UNSLOTH_STUDIO_VENV_DIR when
+# --conda-env is active) to "$@" for env-override installs.
 _run_setup_with_studio_home() {
-    if [ "$_STUDIO_HOME_REDIRECT" = "env" ]; then
+    if [ -n "$_CONDA_ENV_OVERRIDE" ] && [ "$_STUDIO_HOME_REDIRECT" = "env" ]; then
+        UNSLOTH_STUDIO_HOME="$STUDIO_HOME" UNSLOTH_STUDIO_VENV_DIR="$VENV_DIR" "$@"
+    elif [ -n "$_CONDA_ENV_OVERRIDE" ]; then
+        UNSLOTH_STUDIO_VENV_DIR="$VENV_DIR" "$@"
+    elif [ "$_STUDIO_HOME_REDIRECT" = "env" ]; then
         UNSLOTH_STUDIO_HOME="$STUDIO_HOME" "$@"
     else
         "$@"
@@ -2246,6 +2357,22 @@ esac
 # launcher + studio.conf + icon are always written.
 if [ "$TAURI_MODE" != true ]; then
     create_studio_shortcuts "$VENV_ABS_BIN/unsloth" "$OS"
+fi
+
+# When --conda-env is used, the CLI's _studio_venv_python() looks for
+# $STUDIO_HOME/unsloth_studio/bin/python but the venv is the conda env.
+# Fix: symlink $STUDIO_HOME/unsloth_studio -> $VENV_DIR so the CLI finds it.
+# Only create/update the link when no real (non-symlink) directory exists
+# there, to avoid clobbering a previous regular Studio install.
+# Also write studio_venv_path as a belt-and-suspenders fallback for
+# newer CLI builds that read it directly.
+if [ -n "$_CONDA_ENV_OVERRIDE" ]; then
+    mkdir -p "$STUDIO_HOME/share"
+    printf '%s' "$VENV_DIR" > "$STUDIO_HOME/share/studio_venv_path"
+    _us_link="$STUDIO_HOME/unsloth_studio"
+    if [ ! -e "$_us_link" ] || [ -L "$_us_link" ]; then
+        ln -sfn "$VENV_DIR" "$_us_link"
+    fi
 fi
 
 # If setup.sh failed, report and exit now.

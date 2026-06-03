@@ -41,8 +41,11 @@ class LogConfig:
             service_name: Name of the service for logging identification
             env: Environment (development/production), affects logging format
         """
-        # Determine log level from environment
+        # Determine log level from environment.
+        # UNSLOTH_DEBUG=1 is a shorthand for LOG_LEVEL=DEBUG.
         log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+        if os.getenv("UNSLOTH_DEBUG", "").strip() in ("1", "true", "yes"):
+            log_level_name = "DEBUG"
         # Fallback to INFO if an invalid level is provided
         log_level = getattr(logging, log_level_name, logging.INFO)
 
